@@ -1,0 +1,190 @@
+"""
+Mapping sheet automation (image based)
+
+Inputs
+  1. label_to_group file (.xlsx)  : Parent groups + Child groups (wide: parent in one column,
+                                    children in the columns to its right; long format also works)
+  2. CGC file (.xlsx)             : columns  category_name, group_name, class_name, class_image_gcs_file_path
+                                    (needs images of the parent (ABC) groups AND of the child groups)
+
+Output
+  mapping_sheet.xlsx : Parent group | Parent Class | Child Group | Child Class | Score | Status | Suggestion
+
+Run
+  pip install pandas openpyxl requests pillow torch transformers
+  python make_mapping_sheet.py --label label_to_group.xlsx --cgc cgc.xlsx
+"""
+import argparse, io, os, hashlib
+import numpy as np
+import pandas as pd
+import requests
+from PIL import Image
+
+HIGH = 0.85   # score >= HIGH  -> same product family (auto)
+LOW = 0.70    # score <  LOW   -> different (auto -> others)
+              # between LOW and HIGH -> REVIEW (human checks)
+
+CACHE = "image_cache"
+
+
+def norm(s):
+    return " ".join(str(s).lower().split())
+
+
+# ---------------------------------------------------------------- label_to_group -> long rows
+def read_label_file(path, parent_col="A"):
+    raw = pd.read_excel(path, header=None, dtype=str)
+    pidx = ord(parent_col.upper()) - ord("A")
+    rows = []
+    for _, r in raw.iterrows():
+        parent = r.iloc[pidx] if pidx < len(r) else None
+        if pd.isna(parent) or not str(parent).strip():
+            continue
+        parent = str(parent).strip()
+        if norm(parent) in ("parent groups", "parent group"):
+            continue
+        for child in r.iloc[pidx + 1:]:
+            if pd.notna(child) and str(child).strip():
+                if norm(child) in ("child groups", "child group"):
+                    continue
+                rows.append((parent, str(child).strip()))
+    return pd.DataFrame(rows, columns=["parent", "child"])
+
+
+# ---------------------------------------------------------------- images + embeddings
+def load_image(url):
+    os.makedirs(CACHE, exist_ok=True)
+    fp = os.path.join(CACHE, hashlib.md5(url.encode()).hexdigest() + ".png")
+    if os.path.exists(fp):
+        return Image.open(fp).convert("RGB")
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    open(fp, "wb").write(resp.content)
+    return Image.open(io.BytesIO(resp.content)).convert("RGB")
+
+
+_model = None
+
+
+def embed_urls(urls, batch=32):
+    """Return normalized CLIP embeddings (n, dim). Failed downloads -> zero rows."""
+    global _model
+    import torch
+    from transformers import CLIPModel, CLIPProcessor
+    if _model is None:
+        _model = (CLIPModel.from_pretrained("openai/clip-vit-base-patch32"),
+                  CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32"))
+    model, proc = _model
+    out = []
+    for i in range(0, len(urls), batch):
+        imgs, ok = [], []
+        for u in urls[i:i + batch]:
+            try:
+                imgs.append(load_image(u)); ok.append(True)
+            except Exception as e:
+                print("image fail:", u, e); ok.append(False)
+        emb = np.zeros((len(ok), 512), dtype="float32")
+        if imgs:
+            with torch.no_grad():
+                e = model.get_image_features(**proc(images=imgs, return_tensors="pt"))
+            e = torch.nn.functional.normalize(e, dim=1).numpy()
+            emb[np.array(ok)] = e
+        out.append(emb)
+    return np.vstack(out) if out else np.zeros((0, 512), dtype="float32")
+
+
+# ---------------------------------------------------------------- main logic
+def build_mapping(label_df, cgc, embed_fn=embed_urls, high=HIGH, low=LOW):
+    cgc = cgc.copy()
+    cgc["g"] = cgc["group_name"].map(norm)
+    cgc["c"] = cgc["class_name"].map(norm)
+    cgc["emb_i"] = range(len(cgc))
+    E = embed_fn(cgc["class_image_gcs_file_path"].tolist())
+
+    # every group's images (used for parents and for the "best other parent" check)
+    group_idx = cgc.groupby("g")["emb_i"].apply(list).to_dict()
+    parent_names = label_df["parent"].map(norm).unique().tolist()
+    all_parent_keys = [p for p in parent_names if p in group_idx]
+
+    def best_class(child_emb, parent_key):
+        """best matching class inside a parent group -> (class_name, score)"""
+        sub = cgc[cgc["g"] == parent_key]
+        sims = child_emb @ E[sub["emb_i"].values].T          # (n_child_imgs, n_parent_imgs)
+        j = np.unravel_index(sims.argmax(), sims.shape)[1]
+        return sub.iloc[j]["class_name"], float(sims.max())
+
+    rows = []
+    for _, r in label_df.iterrows():
+        parent, child = r["parent"], r["child"]
+        pk, ck = norm(parent), norm(child)
+
+        # child images: look up by group_name first, then class_name
+        idx = group_idx.get(ck) or cgc.loc[cgc["c"] == ck, "emb_i"].tolist()
+        idx = [i for i in idx if E[i].any()]
+        if not idx:
+            rows.append(["", "", child, child, None, "NO IMAGE", "child images CGC file me nahi mili"])
+            continue
+        ce = E[idx]
+
+        own_name, own_score = (None, -1.0)
+        if pk in group_idx and pk != ck:
+            own_name, own_score = best_class(ce, pk)
+
+        # best among all other parents (only as a suggestion / safety check)
+        other_name, other_score, other_parent = None, -1.0, None
+        for k in all_parent_keys:
+            if k in (pk, ck):
+                continue
+            cn, sc = best_class(ce, k)
+            if sc > other_score:
+                other_name, other_score, other_parent = cn, sc, k
+        other_parent_disp = (cgc.loc[cgc["g"] == other_parent, "group_name"].iloc[0]
+                             if other_parent else None)
+
+        if own_score >= high:
+            rows.append([parent, own_name, child, child, round(own_score, 3), "AUTO-MATCH", ""])
+        elif own_score >= low:
+            rows.append([parent, own_name, child, child, round(own_score, 3), "REVIEW", "score beech me hai"])
+        else:
+            sug = ""
+            status = "AUTO-OTHERS"
+            if other_score >= high:
+                status = "REVIEW"
+                sug = f"shayad '{other_parent_disp}' ({other_score:.2f})"
+            rows.append(["others", "others", child, child,
+                         round(own_score, 3) if own_score > -1 else None, status, sug])
+
+    return pd.DataFrame(rows, columns=["Parent group", "Parent Class", "Child Group",
+                                       "Child Class", "Score", "Status", "Suggestion"])
+
+
+def save(df, path):
+    from openpyxl.styles import PatternFill
+    with pd.ExcelWriter(path, engine="openpyxl") as w:
+        df.to_excel(w, index=False)
+        ws = w.sheets["Sheet1"]
+        fills = {"REVIEW": "FFF2CC", "NO IMAGE": "F4CCCC", "AUTO-OTHERS": "E7E6E6"}
+        for row in ws.iter_rows(min_row=2):
+            f = fills.get(row[5].value)
+            if f:
+                for c in row:
+                    c.fill = PatternFill("solid", fgColor=f)
+        for col, wd in zip("ABCDEFG", (38, 38, 38, 38, 8, 14, 45)):
+            ws.column_dimensions[col].width = wd
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--label", required=True, help="label to group xlsx")
+    ap.add_argument("--cgc", required=True, help="CGC xlsx with image links")
+    ap.add_argument("--parent-col", default="A", help="column letter of Parent group in label file")
+    ap.add_argument("--out", default="mapping_sheet.xlsx")
+    a = ap.parse_args()
+
+    label_df = read_label_file(a.label, a.parent_col)
+    cgc = pd.read_excel(a.cgc)
+    print(len(label_df), "parent-child rows,", len(cgc), "images")
+    out = build_mapping(label_df, cgc)
+    save(out, a.out)
+    print(out["Status"].value_counts().to_string())
+    print("saved", a.out)
